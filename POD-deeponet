@@ -1,0 +1,137 @@
+# %% Cell -- train POD-DeepONet on lensing (WDM train/test, CDM+axion zero-shot)
+# Two separate POD bases (alpha_x, alpha_y), computed from real A_train statistics.
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 13
+EPOCHS = 60
+BATCH_SIZE = 32
+N_POD_MODES = 160
+print(DEVICE)
+
+def rel_l2_loss(p, t):
+    return (((p-t)**2).sum(dim=(1,2,3)).sqrt() / ((t**2).sum(dim=(1,2,3)).sqrt()+1e-8)).mean()
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval(); n = d = 0.
+    for kb, ab in loader:
+        kb, ab = kb.to(DEVICE), ab.to(DEVICE); p = model(kb)
+        n += ((p-ab)**2).sum(dim=(1,2,3)).sqrt().sum().item()
+        d += (ab**2).sum(dim=(1,2,3)).sqrt().sum().item()
+    return n/d
+
+# ---- POD basis from real training-set alpha statistics (2 separate bases) ----
+ax_train_flat = A_train[:,0].reshape(len(A_train), -1)
+ay_train_flat = A_train[:,1].reshape(len(A_train), -1)
+pod_mean_x_ = ax_train_flat.mean(dim=0); pod_mean_y_ = ay_train_flat.mean(dim=0)
+centered_x = ax_train_flat - pod_mean_x_; centered_y = ay_train_flat - pod_mean_y_
+Ux, Sx, Vx = torch.pca_lowrank(centered_x, q=N_POD_MODES, niter=4)
+Uy, Sy, Vy = torch.pca_lowrank(centered_y, q=N_POD_MODES, niter=4)
+POD_BASIS_X, POD_BASIS_Y = Vx.to(DEVICE), Vy.to(DEVICE)
+POD_MEAN_X, POD_MEAN_Y = pod_mean_x_.to(DEVICE), pod_mean_y_.to(DEVICE)
+explained_x = (Sx**2).sum() / (centered_x**2).sum()
+explained_y = (Sy**2).sum() / (centered_y**2).sum()
+print(f"POD basis: {N_POD_MODES} modes | alpha_x var explained: {explained_x:.4f} | alpha_y: {explained_y:.4f}")
+
+class PODConvBranch(nn.Module):
+    def __init__(self, ic=1, c1=32, c2=64, c3=128, fc_hidden=320, out_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(ic, c1, 3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(c1, c2, 3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(c2, c3, 3, stride=2, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d(4))
+        self.fc = nn.Sequential(nn.Linear(c3*16, fc_hidden), nn.GELU(), nn.Linear(fc_hidden, out_dim))
+    def forward(self, x): return self.fc(self.net(x).flatten(1))
+
+class PODDeepONet(nn.Module):
+    def __init__(self, pod_basis_x, pod_mean_x, pod_basis_y, pod_mean_y, n_modes=160,
+                 c1=32, c2=64, c3=128, fc_hidden=320, branch_dim=128, coeff_hidden=96):
+        super().__init__()
+        self.n_modes = n_modes
+        self.register_buffer("pod_basis_x", pod_basis_x); self.register_buffer("pod_mean_x", pod_mean_x)
+        self.register_buffer("pod_basis_y", pod_basis_y); self.register_buffer("pod_mean_y", pod_mean_y)
+        self.branch = PODConvBranch(1, c1, c2, c3, fc_hidden, branch_dim)
+        self.coeff_head = nn.Sequential(nn.Linear(branch_dim, coeff_hidden), nn.GELU(), nn.Linear(coeff_hidden, 2*n_modes))
+    def forward(self, x):
+        B, C, H, W = x.shape
+        coeffs = self.coeff_head(self.branch(x))
+        cx, cy = coeffs[:,:self.n_modes], coeffs[:,self.n_modes:]
+        ax = self.pod_mean_x.unsqueeze(0) + cx @ self.pod_basis_x.T
+        ay = self.pod_mean_y.unsqueeze(0) + cy @ self.pod_basis_y.T
+        return torch.stack([ax.view(B,H,W), ay.view(B,H,W)], dim=1)
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+torch.manual_seed(SEED); np.random.seed(SEED)
+g = torch.Generator().manual_seed(SEED)
+train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_train, A_train), batch_size=BATCH_SIZE, shuffle=True, generator=g)
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_test, A_test), batch_size=BATCH_SIZE)
+cdm_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_cdm, A_cdm), batch_size=BATCH_SIZE)
+axion_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_axion, A_axion), batch_size=BATCH_SIZE)
+
+model = PODDeepONet(POD_BASIS_X.clone(), POD_MEAN_X.clone(), POD_BASIS_Y.clone(), POD_MEAN_Y.clone(),
+                     n_modes=N_POD_MODES, c1=32, c2=64, c3=128, fc_hidden=320, branch_dim=128, coeff_hidden=96).to(DEVICE)
+print(f"POD-DeepONet (lensing) params: {count_params(model):,}")
+
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+best_val, best_state = float("inf"), None
+epoch_times = []
+t_start = time.time()
+
+for ep in range(EPOCHS):
+    model.train(); t0 = time.time()
+    for kb, ab in train_loader:
+        kb, ab = kb.to(DEVICE), ab.to(DEVICE)
+        opt.zero_grad(); rel_l2_loss(model(kb), ab).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+    sched.step()
+    dt = time.time() - t0; epoch_times.append(dt)
+
+    val_wdm = evaluate(model, test_loader)
+    val_cdm = evaluate(model, cdm_loader)
+    val_axion = evaluate(model, axion_loader)
+    if val_wdm < best_val:
+        best_val = val_wdm
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    print(f"[POD-DeepONet seed{SEED}] ep {ep:3d}  wdm {val_wdm:.4f}  (best {best_val:.4f})  "
+          f"cdm(0-shot) {val_cdm:.4f}  axion(0-shot) {val_axion:.4f}  ({dt:.1f}s)")
+
+total_time = time.time() - t_start
+print(f"\n[POD-DeepONet seed{SEED}] FINAL best wdm = {best_val:.4f} | median epoch {np.median(epoch_times):.2f}s | total {total_time/60:.2f} min")
+
+model.load_state_dict(best_state)
+final_wdm = evaluate(model, test_loader)
+final_cdm = evaluate(model, cdm_loader)
+final_axion = evaluate(model, axion_loader)
+print(f"FINAL (best ckpt) | wdm {final_wdm:.4f} | cdm(0-shot) {final_cdm:.4f} | axion(0-shot) {final_axion:.4f}")
+
+@torch.no_grad()
+def sample_pred(model, x, y):
+    model.eval()
+    pred = model(x[None].to(DEVICE))[0].cpu()
+    err = (((pred-y)**2).sum().sqrt() / ((y**2).sum().sqrt()+1e-8)).item()
+    return pred, err
+
+VIZ_IDX = 0
+fig, axs = plt.subplots(3, 3, figsize=(9, 9))
+for row, (Kx, Ax, tag) in enumerate([(K_test, A_test, "WDM (test)"),
+                                      (K_cdm, A_cdm, "CDM (0-shot)"),
+                                      (K_axion, A_axion, "Axion (0-shot)")]):
+    pred, err = sample_pred(model, Kx[VIZ_IDX], Ax[VIZ_IDX])
+    true_mag = Ax[VIZ_IDX].norm(dim=0); pred_mag = pred.norm(dim=0)
+    vmax = true_mag.max().item()
+    axs[row,0].imshow(true_mag, vmin=0, vmax=vmax); axs[row,0].set_title(f"True |alpha| {tag}"); axs[row,0].axis('off')
+    axs[row,1].imshow(pred_mag, vmin=0, vmax=vmax); axs[row,1].set_title(f"POD-DeepONet : {err:.4f}"); axs[row,1].axis('off')
+    axs[row,2].imshow((pred_mag-true_mag).abs(), vmin=0, vmax=vmax); axs[row,2].set_title("|error|"); axs[row,2].axis('off')
+plt.tight_layout()
+plt.savefig("poddeeponet_lensing_sample.png", dpi=150, bbox_inches='tight')
+plt.show()

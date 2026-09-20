@@ -1,0 +1,136 @@
+# %% Cell -- train LNO on lensing (WDM train/test, CDM+axion zero-shot)
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 13
+EPOCHS = 60
+BATCH_SIZE = 32
+print(DEVICE)
+
+def rel_l2_loss(p, t):
+    return (((p-t)**2).sum(dim=(1,2,3)).sqrt() / ((t**2).sum(dim=(1,2,3)).sqrt()+1e-8)).mean()
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval(); n = d = 0.
+    for kb, ab in loader:
+        kb, ab = kb.to(DEVICE), ab.to(DEVICE); p = model(kb)
+        n += ((p-ab)**2).sum(dim=(1,2,3)).sqrt().sum().item()
+        d += (ab**2).sum(dim=(1,2,3)).sqrt().sum().item()
+    return n/d
+
+class LNOLayer(nn.Module):
+    def __init__(self, ic, oc, n_poles=8):
+        super().__init__()
+        self.ic, self.oc, self.N = ic, oc, n_poles
+        self.mu_re = nn.Parameter(-1.0 - torch.rand(ic, oc, n_poles))
+        self.mu_im = nn.Parameter(torch.linspace(-3, 3, n_poles).expand(ic, oc, n_poles).clone())
+        s0 = (1.0/(ic*oc))**0.5
+        self.beta_re = nn.Parameter(torch.randn(ic, oc, n_poles) * s0)
+        self.beta_im = nn.Parameter(torch.randn(ic, oc, n_poles) * s0)
+    def forward(self, x):
+        B, _, H, W = x.shape
+        xf = torch.fft.rfft2(x)
+        omega_y = torch.fft.fftfreq(H, device=x.device) * H * 2 * np.pi
+        iom = 1j * omega_y
+        mu   = torch.complex(self.mu_re, self.mu_im)
+        beta = torch.complex(self.beta_re, self.beta_im)
+        denom = iom.view(1,1,1,-1) - mu.unsqueeze(-1)
+        K_sym = (beta.unsqueeze(-1) / denom).sum(dim=2)
+        out_ft = torch.einsum('bihk,ioh->bohk', xf, K_sym)
+        return torch.fft.irfft2(out_ft, s=(H, W))
+
+class LNOBlock(nn.Module):
+    def __init__(self, width, n_poles):
+        super().__init__()
+        self.ln = LNOLayer(width, width, n_poles)
+        self.lc = nn.Conv2d(width, width, 1)
+        self.act = nn.GELU()
+    def forward(self, x): return self.act(self.ln(x) + self.lc(x))
+
+class LNO(nn.Module):
+    def __init__(self, ic=1, oc=2, width=80, n_poles=8, n_layers=4, res=64):
+        super().__init__()
+        ys, xs = torch.meshgrid(torch.linspace(0,1,res), torch.linspace(0,1,res), indexing='ij')
+        self.register_buffer('grid', torch.stack([ys,xs],0))
+        self.fc_in = nn.Conv2d(ic+2, width, 1)
+        self.blocks = nn.ModuleList([LNOBlock(width, n_poles) for _ in range(n_layers)])
+        self.fc1 = nn.Conv2d(width, width, 1); self.fc2 = nn.Conv2d(width, oc, 1); self.act = nn.GELU()
+    def forward(self, x):
+        h = self.fc_in(torch.cat([x, self.grid[None].repeat(x.shape[0],1,1,1)], 1))
+        for b in self.blocks: h = b(h)
+        return self.fc2(self.act(self.fc1(h)))
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+torch.manual_seed(SEED); np.random.seed(SEED)
+g = torch.Generator().manual_seed(SEED)
+train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_train, A_train), batch_size=BATCH_SIZE, shuffle=True, generator=g)
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_test, A_test), batch_size=BATCH_SIZE)
+cdm_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_cdm, A_cdm), batch_size=BATCH_SIZE)
+axion_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_axion, A_axion), batch_size=BATCH_SIZE)
+
+model = LNO(width=80, n_poles=8, res=RES).to(DEVICE)
+print(f"LNO (lensing) params: {count_params(model):,}")
+
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+best_val, best_state = float("inf"), None
+epoch_times = []
+t_start = time.time()
+
+for ep in range(EPOCHS):
+    model.train(); t0 = time.time()
+    for kb, ab in train_loader:
+        kb, ab = kb.to(DEVICE), ab.to(DEVICE)
+        opt.zero_grad(); rel_l2_loss(model(kb), ab).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+    sched.step()
+    dt = time.time() - t0; epoch_times.append(dt)
+
+    val_wdm = evaluate(model, test_loader)
+    val_cdm = evaluate(model, cdm_loader)
+    val_axion = evaluate(model, axion_loader)
+    if val_wdm < best_val:
+        best_val = val_wdm
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    print(f"[LNO seed{SEED}] ep {ep:3d}  wdm {val_wdm:.4f}  (best {best_val:.4f})  "
+          f"cdm(0-shot) {val_cdm:.4f}  axion(0-shot) {val_axion:.4f}  ({dt:.1f}s)")
+
+total_time = time.time() - t_start
+print(f"\n[LNO seed{SEED}] FINAL best wdm = {best_val:.4f} | median epoch {np.median(epoch_times):.2f}s | total {total_time/60:.2f} min")
+
+model.load_state_dict(best_state)
+final_wdm = evaluate(model, test_loader)
+final_cdm = evaluate(model, cdm_loader)
+final_axion = evaluate(model, axion_loader)
+print(f"FINAL (best ckpt) | wdm {final_wdm:.4f} | cdm(0-shot) {final_cdm:.4f} | axion(0-shot) {final_axion:.4f}")
+
+@torch.no_grad()
+def sample_pred(model, x, y):
+    model.eval()
+    pred = model(x[None].to(DEVICE))[0].cpu()
+    err = (((pred-y)**2).sum().sqrt() / ((y**2).sum().sqrt()+1e-8)).item()
+    return pred, err
+
+VIZ_IDX = 0
+fig, axs = plt.subplots(3, 3, figsize=(9, 9))
+for row, (Kx, Ax, tag) in enumerate([(K_test, A_test, "WDM (test)"),
+                                      (K_cdm, A_cdm, "CDM (0-shot)"),
+                                      (K_axion, A_axion, "Axion (0-shot)")]):
+    pred, err = sample_pred(model, Kx[VIZ_IDX], Ax[VIZ_IDX])
+    true_mag = Ax[VIZ_IDX].norm(dim=0); pred_mag = pred.norm(dim=0)
+    vmax = true_mag.max().item()
+    axs[row,0].imshow(true_mag, vmin=0, vmax=vmax); axs[row,0].set_title(f"True |alpha| {tag}"); axs[row,0].axis('off')
+    axs[row,1].imshow(pred_mag, vmin=0, vmax=vmax); axs[row,1].set_title(f"LNO : {err:.4f}"); axs[row,1].axis('off')
+    axs[row,2].imshow((pred_mag-true_mag).abs(), vmin=0, vmax=vmax); axs[row,2].set_title("|error|"); axs[row,2].axis('off')
+plt.tight_layout()
+plt.savefig("lno_lensing_sample.png", dpi=150, bbox_inches='tight')
+plt.show()

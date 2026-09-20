@@ -1,0 +1,154 @@
+# %% Cell -- train PDNO on lensing (WDM train/test, CDM+axion zero-shot)
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 13
+EPOCHS = 60
+BATCH_SIZE = 32
+print(DEVICE)
+
+def rel_l2_loss(p, t):
+    return (((p-t)**2).sum(dim=(1,2,3)).sqrt() / ((t**2).sum(dim=(1,2,3)).sqrt()+1e-8)).mean()
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval(); n = d = 0.
+    for kb, ab in loader:
+        kb, ab = kb.to(DEVICE), ab.to(DEVICE); p = model(kb)
+        n += ((p-ab)**2).sum(dim=(1,2,3)).sqrt().sum().item()
+        d += (ab**2).sum(dim=(1,2,3)).sqrt().sum().item()
+    return n/d
+
+class SymbolNet(nn.Module):
+    def __init__(self, ic, oc, hidden=64, n_layers=3, n_freq=4):
+        super().__init__()
+        self.ic, self.oc = ic, oc
+        layers, c = [], 2*(1+2*n_freq)
+        for _ in range(n_layers):
+            layers += [nn.Conv2d(c, hidden, 1), nn.GELU()]; c = hidden
+        self.body = nn.Sequential(*layers)
+        self.head = nn.Conv2d(hidden, ic*oc*2, 1)
+        self.n_freq = n_freq
+    def _feat(self, H, W, device):
+        ky = torch.fft.fftfreq(H, device=device)*H
+        kx = torch.fft.rfftfreq(W, device=device)*W
+        KY, KX = torch.meshgrid(ky, kx, indexing='ij')
+        nyq = max(H, W)/2
+        base = torch.stack([KX/nyq, KY/nyq])
+        ff = [base]
+        for i in range(self.n_freq):
+            ff += [torch.sin(2**i*np.pi*base), torch.cos(2**i*np.pi*base)]
+        return torch.cat(ff, 0)[None]
+    def forward(self, H, W, device):
+        h = self.head(self.body(self._feat(H, W, device)))
+        h = h.view(self.ic, self.oc, 2, H, W//2+1)
+        return torch.complex(h[:,:,0], h[:,:,1])
+
+class PDIOLayer(nn.Module):
+    def __init__(self, ic, oc, hidden=64, n_layers=3, n_freq=4):
+        super().__init__()
+        self.sym = SymbolNet(ic, oc, hidden, n_layers, n_freq)
+    def forward(self, x):
+        H, W = x.shape[-2], x.shape[-1]
+        xf = torch.fft.rfft2(x)
+        R = self.sym(H, W, x.device)
+        of = torch.einsum('bihw,iohw->bohw', xf, R)
+        return torch.fft.irfft2(of, s=(H, W))
+
+class PDNOBlock(nn.Module):
+    def __init__(self, width, hidden, n_layers, n_freq):
+        super().__init__()
+        self.pdio = PDIOLayer(width, width, hidden, n_layers, n_freq)
+        self.lc = nn.Conv2d(width, width, 1)
+        self.act = nn.GELU()
+    def forward(self, x):
+        return self.act(self.pdio(x) + self.lc(x))
+
+class PDNO(nn.Module):
+    def __init__(self, ic=1, oc=2, width=40, hidden=64, n_layers_block=4, n_freq=4, res=64):
+        super().__init__()
+        ys, xs = torch.meshgrid(torch.linspace(0,1,res), torch.linspace(0,1,res), indexing='ij')
+        self.register_buffer('grid', torch.stack([ys,xs],0))
+        self.fc_in = nn.Conv2d(ic+2, width, 1)
+        self.blocks = nn.ModuleList([PDNOBlock(width, hidden, 3, n_freq) for _ in range(n_layers_block)])
+        self.fc1 = nn.Conv2d(width, width, 1)
+        self.fc2 = nn.Conv2d(width, oc, 1)
+        self.act = nn.GELU()
+    def forward(self, x):
+        h = self.fc_in(torch.cat([x, self.grid[None].repeat(x.shape[0],1,1,1)], 1))
+        for b in self.blocks: h = b(h)
+        return self.fc2(self.act(self.fc1(h)))
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+torch.manual_seed(SEED); np.random.seed(SEED)
+g = torch.Generator().manual_seed(SEED)
+train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_train, A_train), batch_size=BATCH_SIZE, shuffle=True, generator=g)
+test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_test, A_test), batch_size=BATCH_SIZE)
+cdm_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_cdm, A_cdm), batch_size=BATCH_SIZE)
+axion_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(K_axion, A_axion), batch_size=BATCH_SIZE)
+
+model = PDNO(width=40, hidden=64, n_layers_block=4, n_freq=4, res=RES).to(DEVICE)
+print(f"PDNO (lensing) params: {count_params(model):,}")
+
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+best_val, best_state = float("inf"), None
+epoch_times = []
+t_start = time.time()
+
+for ep in range(EPOCHS):
+    model.train(); t0 = time.time()
+    for kb, ab in train_loader:
+        kb, ab = kb.to(DEVICE), ab.to(DEVICE)
+        opt.zero_grad(); rel_l2_loss(model(kb), ab).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+    sched.step()
+    dt = time.time() - t0; epoch_times.append(dt)
+
+    val_wdm = evaluate(model, test_loader)
+    val_cdm = evaluate(model, cdm_loader)
+    val_axion = evaluate(model, axion_loader)
+    if val_wdm < best_val:
+        best_val = val_wdm
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    print(f"[PDNO seed{SEED}] ep {ep:3d}  wdm {val_wdm:.4f}  (best {best_val:.4f})  "
+          f"cdm(0-shot) {val_cdm:.4f}  axion(0-shot) {val_axion:.4f}  ({dt:.1f}s)")
+
+total_time = time.time() - t_start
+print(f"\n[PDNO seed{SEED}] FINAL best wdm = {best_val:.4f} | median epoch {np.median(epoch_times):.2f}s | total {total_time/60:.2f} min")
+
+model.load_state_dict(best_state)
+final_wdm = evaluate(model, test_loader)
+final_cdm = evaluate(model, cdm_loader)
+final_axion = evaluate(model, axion_loader)
+print(f"FINAL (best ckpt) | wdm {final_wdm:.4f} | cdm(0-shot) {final_cdm:.4f} | axion(0-shot) {final_axion:.4f}")
+
+@torch.no_grad()
+def sample_pred(model, x, y):
+    model.eval()
+    pred = model(x[None].to(DEVICE))[0].cpu()
+    err = (((pred-y)**2).sum().sqrt() / ((y**2).sum().sqrt()+1e-8)).item()
+    return pred, err
+
+VIZ_IDX = 0
+fig, axs = plt.subplots(3, 3, figsize=(9, 9))
+for row, (Kx, Ax, tag) in enumerate([(K_test, A_test, "WDM (test)"),
+                                      (K_cdm, A_cdm, "CDM (0-shot)"),
+                                      (K_axion, A_axion, "Axion (0-shot)")]):
+    pred, err = sample_pred(model, Kx[VIZ_IDX], Ax[VIZ_IDX])
+    true_mag = Ax[VIZ_IDX].norm(dim=0); pred_mag = pred.norm(dim=0)
+    vmax = true_mag.max().item()
+    axs[row,0].imshow(true_mag, vmin=0, vmax=vmax); axs[row,0].set_title(f"True |alpha| {tag}"); axs[row,0].axis('off')
+    axs[row,1].imshow(pred_mag, vmin=0, vmax=vmax); axs[row,1].set_title(f"PDNO : {err:.4f}"); axs[row,1].axis('off')
+    axs[row,2].imshow((pred_mag-true_mag).abs(), vmin=0, vmax=vmax); axs[row,2].set_title("|error|"); axs[row,2].axis('off')
+plt.tight_layout()
+plt.savefig("pdno_lensing_sample.png", dpi=150, bbox_inches='tight')
+plt.show()
